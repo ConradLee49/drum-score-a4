@@ -1,0 +1,21 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# work files produced by the pipeline
+out/
+*.pdf
+*_strip.png
+*.png.p*.png
+*_stitch.json
+*_framebars.json
+*_bars.json
+src.mp4
+*.mp4
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
