@@ -175,8 +175,8 @@ def main():
                     help="thickness of the drawn bar lines (0 disables)")
     ap.add_argument("--measures-per-line", type=int, default=0,
                     help="fixed number of measures per line (0 = auto width)")
-    ap.add_argument("--rest-ink", type=float, default=70.0,
-                    help="ink budget (px) for a measure to count as empty")
+    ap.add_argument("--rest-ink", type=float, default=120.0,
+                    help="ink budget (px, staff lines excluded) for a measure to count as empty")
     ap.add_argument("--no-merge-rests", action="store_true",
                     help="keep every empty measure instead of a multi-measure rest")
     ap.add_argument("--repeat-dist", type=float, default=0.06,
@@ -187,6 +187,8 @@ def main():
                     help="explicit fold, format 'a-b:L' (measures a..b, L bars shown once)")
     ap.add_argument("--repeat-min", type=int, default=3,
                     help="minimum run of identical measures to print as xN")
+    ap.add_argument("--uniform", action="store_true",
+                    help="keep measures at natural width, justify with gaps")
     ap.add_argument("--debug", action="store_true",
                     help="print empty-measure runs and repeat groups")
     ap.add_argument("--highpass", type=float, default=0.0,
@@ -212,6 +214,17 @@ def main():
         import json as _json
         bars = [int(b) for b in _json.load(open(args.bars_json)) if 0 < b < w]
         print(f"bar lines from {args.bars_json}: {len(bars)}")
+    # the head of the strip is the clef block, and the tail is often a stub cut
+    # off by the video: neither is a measure, so drop them instead of printing
+    # a blank bar at the start / end of the chart
+    if len(bars) > 4:
+        med = float(np.median(np.diff(bars)))
+        if bars[0] < 0.55 * med:
+            print(f"dropping leading clef block ({bars[0]}px)")
+            bars = bars[1:]
+        while len(bars) > 4 and (bars[-1] - bars[-2]) < 0.5 * med:
+            print(f"dropping trailing stub ({bars[-1] - bars[-2]}px)")
+            bars = bars[:-1]
     print(f"bar lines used: {len(bars)}")
     if args.clef_px:
         a_, b_ = (int(v) for v in args.clef_px.split(","))
@@ -244,7 +257,7 @@ def main():
     dark = ink < 160
     keep = np.ones(ink.shape[0], bool)
     for y in lines:
-        keep[max(0, y - 3):y + 4] = False
+        keep[max(0, y - 1):y + 2] = False
     span = float(lines[-1] - lines[0])
 
     def is_empty(a, b):
@@ -253,7 +266,7 @@ def main():
         if total == 0:
             return True
         rr = np.flatnonzero(sub.any(axis=1))
-        return total <= args.rest_ink and (rr[-1] - rr[0]) <= 0.45 * span
+        return total <= args.rest_ink and (rr[-1] - rr[0]) <= 0.9 * span
     def same(pa, pb):
         """Same music test: normalized horizontal ink profile, shift-tolerant."""
         a_, b_ = measures[pa], measures[pb]
@@ -366,6 +379,21 @@ def main():
         widths_px = [x["b"] - x["a"] for x in items]
         mpl = max(1, int(round(usable_w / scale / float(np.median(widths_px)))))
     plan = [items[k:k + mpl] for k in range(0, len(items), mpl)]
+    if args.uniform and mpl:
+        med_px = float(np.median(np.diff(bars))) if len(bars) > 2 else 0.0
+        widest = 0.0
+        for line in plan:
+            wpx = sum((it["b"] - it["a"]) if it["kind"] == "bar" else med_px
+                      for it in line)
+            widest = max(widest, wpx)
+        if widest > 0:
+            cap = usable_w / (widest + clef_px * (1 if clef_tile is not None else 0))
+            if cap < scale:
+                print(f"uniform fit: staff space {args.staff_space_mm:.2f}mm -> "
+                      f"{cap * space / 72.0 * 25.4:.2f}mm")
+                scale = cap
+                line_h = h * scale
+                per_page = max(1, int((usable_h + gap) // (line_h + gap)))
     print(f"{len(plan)} lines -> {-(-len(plan) // per_page)} pages (mpl={mpl})")
 
     dpi_scale = args.dpi / 72.0
@@ -377,22 +405,55 @@ def main():
         for row, line_items in enumerate(plan[start:start + per_page]):
             add_clef = clef_tile is not None and not (start == 0 and row == 0)
             lead = clef_px * scale if add_clef else 0.0
-            slot = (usable_w - lead) / mpl
-            widths = [slot] * len(line_items)
+            pad = 0.0
+            adv = None
+            med_px = float(np.median(np.diff(edges[:-1]))) if len(edges) > 2 else 0.0
+
+            def slot_px(it):
+                # a multi-measure rest is written once, so it takes one measure
+                return med_px if it["kind"] == "rest" else (it["b"] - it["a"])
+
+            if args.uniform and mpl:
+                # fixed count per line, but every measure keeps its own width:
+                # a line that would overflow is scaled down as a whole, so no
+                # measure ever overlaps its neighbour (that is what used to eat
+                # notes) and no head is ever stretched
+                widths = [slot_px(it) * scale for it in line_items]
+                slack = usable_w - lead - sum(widths)
+                pad = slack / (len(line_items) - 1) if len(line_items) > 1 else 0.0
+                if pad < 0:
+                    pad = 0.0
+                # a short last line must not be blown up to full width, but a
+                # full line is still justified to the right margin
+                if len(line_items) < mpl:
+                    pad = min(pad, 0.40 * med_px * scale)
+            elif args.uniform and len(line_items) > 1:
+                widths = [slot_px(it) * scale for it in line_items]
+                slack = max(0.0, usable_w - lead - sum(widths))
+                pad = slack / (len(line_items) - 1)
+            else:
+                slot = (usable_w - lead) / mpl
+                widths = [slot] * len(line_items)
             plain = [plain_bar(ink, lines, it["a"]) for it in line_items]
             plain_end = plain_bar(ink, lines, line_items[-1]["b"])
-            pad = 0.0
             squeeze = 1.0
-            line_w = lead + sum(widths)
+            line_w = lead + (sum(adv) if adv else
+                             sum(widths) + pad * max(0, len(line_items) - 1))
+            if args.debug:
+                print(f"  line p{page_no}r{row}: items={len(line_items)} "
+                      f"lead={lead:.1f} widths={[round(w, 1) for w in widths]} "
+                      f"pad={pad:.1f} line_w={line_w:.1f} usable={usable_w:.1f}")
             if line_w > usable_w:
                 squeeze = usable_w / line_w
                 widths = [x * squeeze for x in widths]
+                if adv:
+                    adv = [x * squeeze for x in adv]
                 lead *= squeeze
             line_h_eff = line_h * squeeze
             y = int(round((margin + top_pad + row * (line_h + gap)) * dpi_scale))
             if squeeze < 1.0:
                 y += int(round((line_h - line_h_eff) * 0.5 * dpi_scale))
-            total_w = lead + sum(widths) + pad * max(0, len(line_items) - 1)
+            total_w = line_w * squeeze if squeeze else line_w
             # bridge the widened gaps so the staff reads as one continuous line
             x0 = int(round(margin * dpi_scale))
             x1 = int(round((margin + total_w) * dpi_scale))
@@ -422,23 +483,28 @@ def main():
                         draw.text((bx + tw // 2, num_y), f"\u00d7{it['rep']}",
                                   font=font, fill=0, anchor="ms")
                 else:
-                    # multi-measure rest: thick bar on the middle of the staff
-                    left = bx + int(round(0.16 * wp * dpi_scale))
-                    right = bx + int(round(0.84 * wp * dpi_scale))
-                    mid = y + int(round(0.5 * (lines[2] + lines[3]) * scale * squeeze
-                                        * dpi_scale))
-                    thick = max(2, int(round(0.30 * space * scale * squeeze * dpi_scale)))
-                    draw.rectangle((left, mid - thick // 2, right, mid - thick // 2 + thick),
-                                   fill=0)
+                    # multi-measure rest: a thin bar hanging under the 4th
+                    # staff line with short end serifs, count printed above
+                    inset = 0.26 * wp
+                    left = bx + int(round(inset * dpi_scale))
+                    right = bx + int(round((wp - inset) * dpi_scale))
+                    hang = y + int(round(lines[3] * scale * squeeze * dpi_scale))
+                    thick = max(2, int(round(0.20 * space * scale * squeeze * dpi_scale)))
+                    draw.rectangle((left, hang, right, hang + thick), fill=0)
+                    serif = max(3, int(round(1.1 * space * scale * squeeze * dpi_scale)))
+                    draw.line((left, hang, left, hang + serif), fill=0,
+                              width=max(1, thick))
+                    draw.line((right, hang, right, hang + serif), fill=0,
+                              width=max(1, thick))
                     if it["n"] > 1:
-                        font = _font(max(10, int(round(2.2 * space * scale * squeeze
+                        font = _font(max(9, int(round(1.9 * space * scale * squeeze
                                                        * dpi_scale))))
-                        num_y = y_top - int(round(0.9 * space * scale * squeeze * dpi_scale))
+                        num_y = y_top - int(round(0.55 * space * scale * squeeze * dpi_scale))
                         draw.text(((left + right) // 2, num_y), str(it["n"]),
                                   font=font, fill=0, anchor="ms")
                 if args.bar_width_pt > 0 and plain[idx]:
                     draw.line((bx, y_top, bx, y_bot), fill=0, width=bar_px)
-                x += wp + pad
+                x += adv[idx] if adv else wp + pad
             if args.bar_width_pt > 0 and plain_end:
                 bx = x0 + int(round((x - pad) * dpi_scale))
                 draw.line((bx, y_top, bx, y_bot), fill=0, width=bar_px)
