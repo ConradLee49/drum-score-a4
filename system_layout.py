@@ -49,19 +49,27 @@ def find_staves(ink):
     return staves
 
 
-def bar_columns(ink, staves):
+def bar_columns(ink, staves, cover=0.7, gap=10):
     """Columns that cut through every staff = real bar lines.
 
     A stem or a beam lives inside one staff, a bar line crosses them all, so
-    requiring every staff to be filled is what separates the two.
+    requiring every staff to be filled is what separates the two.  The test is
+    a *continuous* run of at least `cover` x the staff height (a morphological
+    opening with a vertical kernel) rather than a mean: mean fill is fooled by
+    a fat chord that happens to line up with a stem in the next staff, while a
+    real bar line is one uninterrupted stroke from above the top line to below
+    the bottom one.
     """
     score = np.zeros(ink.shape[1], np.int16)
     for st in staves:
-        score += (ink[st[0]:st[-1] + 1].mean(axis=0) > 0.45)
+        band = (ink[st[0]:st[-1] + 1] > 0.5).astype(np.uint8) * 255
+        k = max(6, int(round(cover * band.shape[0])))
+        op = cv2.morphologyEx(band, cv2.MORPH_OPEN, np.ones((k, 1), np.uint8))
+        score += (op.max(axis=0) > 0)
     cols = np.flatnonzero(score >= len(staves))
     out = []
     for c in cols:
-        if out and c - out[-1] <= 10:
+        if out and c - out[-1] <= gap:
             continue
         out.append(int(c))
     return out
@@ -112,6 +120,11 @@ def clean(path, gmin, gdim, gbright, blob_cut=5.5):
     dim = (g > gmin) & (g < gdim)
     ink[dim] = 0.85 + 0.15 * (g[dim] - gmin) / max(1.0, gdim - gmin)
     ink[g > gbright] = 1.0
+    # local contrast: where the translucent photo sits on top of the score it
+    # pulls a bar line down into the mid greys, i.e. into the band we reject --
+    # comparing against a blurred copy puts those strokes back
+    bg = cv2.GaussianBlur(g, (0, 0), 18)
+    ink[(g - bg) > 15] = 1.0
     if blob_cut > 0:
         thick = cv2.distanceTransform((g > 60).astype(np.uint8), cv2.DIST_L2, 5)
         core = (thick > blob_cut).astype(np.uint8)

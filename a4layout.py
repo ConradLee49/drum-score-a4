@@ -189,6 +189,11 @@ def main():
                     help="minimum run of identical measures to print as xN")
     ap.add_argument("--uniform", action="store_true",
                     help="keep measures at natural width, justify with gaps")
+    ap.add_argument("--balance", action="store_true",
+                    help="break lines by natural width (not a fixed count) and pick "
+                         "the largest staff size that fits in --max-pages pages")
+    ap.add_argument("--max-pages", type=int, default=2,
+                    help="page budget used by --balance")
     ap.add_argument("--debug", action="store_true",
                     help="print empty-measure runs and repeat groups")
     ap.add_argument("--highpass", type=float, default=0.0,
@@ -226,7 +231,9 @@ def main():
             print(f"dropping trailing stub ({bars[-1] - bars[-2]}px)")
             bars = bars[:-1]
     print(f"bar lines used: {len(bars)}")
-    if args.clef_px:
+    if args.clef_px and args.clef_px.strip().lower() in ("none", "0", "off"):
+        clef = None
+    elif args.clef_px:
         a_, b_ = (int(v) for v in args.clef_px.split(","))
         clef = (a_, b_)
     else:
@@ -375,10 +382,91 @@ def main():
           f"{sum(1 for x in items if x.get('rep', 1) > 1)} repeated groups)")
 
     mpl = args.measures_per_line
-    if mpl <= 0:
+    if args.balance:
+        # ---- line breaking by natural width -------------------------------
+        # Measures in a scrolling-score strip are as wide as their content
+        # (a bar full of 16ths is three times a bar of quarters), so a fixed
+        # count per line either overflows the worst line (and everything gets
+        # squeezed) or leaves most lines half empty.  Pack by width instead and
+        # keep the largest staff size that still fits the page budget.
+        med_px_b = float(np.median(np.diff(bars))) if len(bars) > 2 else 0.0
+
+        def nat_px(it):
+            return med_px_b if it["kind"] == "rest" else (it["b"] - it["a"])
+
+        def pack(s):
+            budget = usable_w - (clef_px if clef_tile is not None else 0)
+            out, cur, curpx = [], [], 0.0
+            for it in items:
+                w = nat_px(it) * s
+                if cur and curpx + w > budget:
+                    out.append(cur)
+                    cur, curpx = [], 0.0
+                cur.append(it)
+                curpx += w
+            if cur:
+                out.append(cur)
+            return out
+
+        def layout_at(s):
+            pl = pack(s)
+            lh = h * s
+            pp = max(1, int((usable_h + gap) // (lh + gap)))
+            return pl, pp, -(-len(pl) // pp)
+
+        s = scale
+        plan, per_page, n_pages = layout_at(s)
+        for _ in range(90):
+            if n_pages <= args.max_pages:
+                break
+            s *= 0.97
+            plan, per_page, n_pages = layout_at(s)
+        # Shrinking just enough to fit the page budget often leaves every line
+        # 15-20% short (three wide measures overflow by a few points, so they
+        # only ever fit two per line).  Trade a couple of percent of staff size
+        # for lines that actually reach the right margin.
+        budget_w = usable_w - (clef_px if clef_tile is not None else 0.0)
+        n_pages0 = n_pages
+        best = (float(np.mean([sum(nat_px(it) for it in ln) * s / budget_w
+                               for ln in plan])), s, plan, per_page, n_pages)
+        for k in range(1, 12):
+            ks = s * (0.98 ** k)
+            if ks < s * 0.895:
+                break
+            kp, kpp, knp = layout_at(ks)
+            # keep the same page count: a slightly smaller staff that suddenly
+            # fits on one page is not an improvement, it is a smaller chart
+            if knp != n_pages0:
+                break
+            fill = float(np.mean([sum(nat_px(it) for it in ln) * ks / budget_w
+                                  for ln in kp]))
+            if fill > best[0] + 0.02:
+                best = (fill, ks, kp, kpp, knp)
+        fill, s, plan, per_page, n_pages = best
+        print(f"balance: line fill {fill * 100:.0f}%")
+        # a tail line with a single measure looks like a mistake: pull measures
+        # down from the previous line while they still fit
+        if len(plan) > 1:
+            budget = usable_w - (clef_px if clef_tile is not None else 0)
+            while len(plan[-2]) > 1:
+                cand = plan[-2][-1]
+                used = sum(nat_px(it) for it in plan[-1]) * s + nat_px(cand) * s
+                if used > budget or len(plan[-1]) >= len(plan[-2]) - 1:
+                    break
+                plan[-1].insert(0, plan[-2].pop())
+        args.uniform = True
+        scale = s
+        line_h = h * scale
+        print(f"balance: staff space {scale * space / 72.0 * 25.4:.2f}mm, "
+              f"{len(plan)} lines, {per_page}/page -> {n_pages} pages "
+              f"(measures/line {min(len(l) for l in plan)}..{max(len(l) for l in plan)})")
+        mpl = 0
+    elif mpl <= 0:
         widths_px = [x["b"] - x["a"] for x in items]
         mpl = max(1, int(round(usable_w / scale / float(np.median(widths_px)))))
-    plan = [items[k:k + mpl] for k in range(0, len(items), mpl)]
+        plan = [items[k:k + mpl] for k in range(0, len(items), mpl)]
+    else:
+        plan = [items[k:k + mpl] for k in range(0, len(items), mpl)]
     if args.uniform and mpl:
         med_px = float(np.median(np.diff(bars))) if len(bars) > 2 else 0.0
         widest = 0.0
@@ -427,12 +515,15 @@ def main():
                 # full line is still justified to the right margin
                 if len(line_items) < mpl:
                     pad = min(pad, 0.40 * med_px * scale)
-            elif args.uniform and len(line_items) > 1:
+            elif args.uniform:
                 widths = [slot_px(it) * scale for it in line_items]
                 slack = max(0.0, usable_w - lead - sum(widths))
-                pad = slack / (len(line_items) - 1)
+                pad = slack / (len(line_items) - 1) if len(line_items) > 1 else 0.0
+                # a line that is naturally short (usually the last one) must not
+                # be spread over the page: cap the gap and leave it ragged
+                pad = min(pad, 0.45 * med_px * scale)
             else:
-                slot = (usable_w - lead) / mpl
+                slot = (usable_w - lead) / max(1, mpl)
                 widths = [slot] * len(line_items)
             plain = [plain_bar(ink, lines, it["a"]) for it in line_items]
             plain_end = plain_bar(ink, lines, line_items[-1]["b"])

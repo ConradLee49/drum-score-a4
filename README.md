@@ -34,7 +34,8 @@
 
       map_bars.py ─────────► *_bars.json        映射到谱带坐标并去重
 
-      a4layout.py ─────────► *.pdf              A4 排版输出
+      a4layout.py ─────────► *.pdf              A4 排版输出（重排版）
+      montage.py  ─────────► *.pdf              A4 拼贴输出（剪切粘贴，不漏音符）
 ```
 
 `stitch.py` 和 `extract2d.py` 是两条互斥的取带路径：
@@ -76,7 +77,11 @@ ffmpeg -ss 10 -i src.mp4 -frames:v 1 out/frame.png
 ```
 
 输出 `out/stem_strip.png`（可能几万像素宽）与 `out/stem_stitch.json`。
-每个拼接链接都会打印 `corr` / `mae`，`REJECT` 说明那一段没对齐，需要回头看。
+每个拼接链接都会打印 `corr` / `ink_mae`，`REJECT` 说明那一段没对齐，需要回头看。
+
+> 拼接用的是**亮色墨迹掩膜**的列剖面（不是灰度）：背景里有动图/照片时，灰度剖面的残差
+> 会被背景变化顶掉，而一条被 REJECT 的链接会**直接丢掉那一段音乐**（谱带只按接受的位移
+> 前进）。所以只要谱是亮谱深底，就优先用掩膜判据。
 
 ### 1b) 谱面也有竖向位移：按谱号取带
 
@@ -95,7 +100,10 @@ python bars_from_frames.py src.mp4 out/stem_framebars.json
 ```
 
 原理：一帧里有多行谱系统时，**真小节线会同时切穿多行谱**，而符干/谱号只属于一行。
-所以要求某一列在 ≥50% 的谱系统里都是贯穿的竖线。
+所以要求某一列在全部谱系统里都是一条**连续**竖笔画（竖向形态学开运算，长度 ≥ 70% 谱高）。
+
+局部反差（`g - GaussianBlur(g, 18) > 15`）会把被半透明照片压暗到中灰的小节线重新算回墨迹——
+之前用绝对灰度带时，正是这里的漏检。
 
 ### 3) 映射到谱带坐标
 
@@ -167,6 +175,65 @@ python system_layout.py out/band_strip.png \
 播放光标带和人像/照片残留（中灰区间剔除）→ 按系统分页。
 
 想只留其中一行（比如只要鼓），把谱带按 y 区间单独截出来，再交给 `a4layout.py` 即可。
+
+## 只要鼓谱：从乐队总谱里切一行
+
+源视频是**多行谱**（吉他 / 贝斯 / 鼓 叠在一起）而只要你那一行时，走这条线：
+
+```bash
+# 1) 整条谱带拼起来（小节线要横穿所有行才判得准）
+python stitch.py src.mp4 135 1000 out/band
+
+# 2) 重新取墨 + 找小节线（局部反差，照片压暗的线也找得到）
+python - <<'EOF'
+import cv2, json, numpy as np, system_layout as sl
+ink, struct = sl.clean("out/band_strip.png", 35, 80, 160)
+staves = sl.find_staves(struct)
+bars = sl.bar_columns(ink, staves)
+json.dump(bars, open("out/bars.json", "w"))
+print(len(bars), "bar lines")
+EOF
+
+# 3) 只切鼓那一行，二值化成黑谱白纸
+python cut_staff.py out/band_strip.png --bars out/bars.json \
+  --rows 703:800 --lines 723,733,744,753,762 -o out/drum.png
+
+# 4) 拼贴成 A4
+python montage.py out/drum.png --bars out/bars.json \
+  --lines 20,30,41,50,59 --per-line 4 -o out/drum.pdf
+```
+
+`cut_staff.py` 的 `--rows` 要**把谱线下方那几行连梁也包进来**（鼓谱的低音谱表会连梁
+到谱线下方 30~35 px），`--lines` 给 5 条谱线的绝对行号；两者都可以先用
+`find_staves()` 打出来看。
+
+### 小节线漏检时
+
+Guitar Pro 按音符数分宽度，所以同一份谱里 **16 分音符的小节会比 8 分音符的宽 ~1.5 倍**，
+这是源的版面，不是漏检。如果确实有断开的线（照片盖住、或者源里那条线只画了半截），
+用 `regularize.py` 按“本段的典型小节宽度”补齐：
+
+```bash
+python regularize.py out/band_strip.png --bars out/bars.json -o out/bars_fixed.json
+# 88 -> 89 bars (+1); spacing median 265px min 127 max 406
+```
+
+它只补 **≥1.4 倍局部宽度**的空档（也就是“这一格明显能塞两小节”），并把插入的线吸附到
+附近最像竖笔画的那一列（`--snap` 控制搜索范围）。
+
+### `montage.py` 的三种宽度模式
+
+| 模式 | 小节线 | 符头变形 | 适用 |
+| --- | --- | --- | --- |
+| `--cap 0.85`（默认） | 等密度的行严格等距（实测 20/23 行 1.00） | ≤15%（0.85–1.18） | 想要整齐又不想把音符压扁 |
+| `--equal` | 全部等距 | 密集小节最窄压到 0.70 | 只要版面绝对整齐 |
+| `--cap 0` | 跟随源的宽度（258–406 px） | 无 | 忠实还原视频版面 |
+
+`--cap` 模式的原理：一条小节的横向缩放上下限是 `[cap*w, w/cap]`，整行可用宽度做
+water-filling 求出**尽量相等**的槽位，剩下的宽度转成小节之间的空隙；一行全是密集小节
+时其余放不下，就整行等比缩小（谱间距从 1.6mm 降到约 1.29mm），而不是把音符压得更扁。
+一行里宽窄差太大（无法在 cap 内等分）时，该行的 cap 自动放宽到 `sqrt(min_w/max_w)`，
+只影响这一行。
 
 ## 已知限制
 

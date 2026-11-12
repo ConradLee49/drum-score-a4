@@ -23,8 +23,20 @@ def band_gray(frame, top, bottom, width=None):
     return g
 
 
-def profile(g):
-    p = g.astype(np.float32).mean(axis=0)
+def ink_mask(g, thresh=150.0):
+    """Notation only.
+
+    The notation of these videos is the only thing near white; the background
+    photo and the playhead glow live in the mid greys.  Profiling the mask
+    instead of the raw grayscale is what stops an *animated* background from
+    vetoing correct shifts (and a rejected link silently loses that stretch of
+    music, because the strip only ever advances by accepted shifts).
+    """
+    return (g > thresh).astype(np.uint8)
+
+
+def profile(g, thresh=150.0):
+    p = ink_mask(g, thresh).sum(axis=0).astype(np.float32)
     k = 9
     pad = np.pad(p, (k // 2, k // 2), mode="edge")
     med = np.median(np.lib.stride_tricks.sliding_window_view(pad, k), axis=1)
@@ -140,20 +152,24 @@ def main():
             kept, images, profs = kept[1:], images[1:], profs[1:]
     offsets = [0]
     links = []
+    masks = [ink_mask(im) for im in images]
     for i in range(1, len(images)):
         max_shift = width - 200
         dx, corr = best_shift(profs[i - 1], profs[i], max_shift)
-        # residual check on the overlap
+        # residual check on the overlap, on masks: a background change is not a
+        # reason to throw a correct shift away
         if dx >= 0:
-            a, b = images[i - 1][:, dx:], images[i][:, : width - dx]
+            a, b = masks[i - 1][:, dx:], masks[i][:, : width - dx]
         else:
-            a, b = images[i - 1][:, : width + dx], images[i][:, -dx:]
-        mae = float(np.abs(a.astype(np.float32) - b.astype(np.float32)).mean()) if a.size else 999
-        ok = corr > 0.55 and mae < 12
-        links.append({"i": i, "dx": int(dx), "corr": round(corr, 3), "overlap_mae": round(mae, 2),
+            a, b = masks[i - 1][:, : width + dx], masks[i][:, -dx:]
+        imae = float(np.abs(a.astype(np.float32) - b.astype(np.float32)).mean())
+        ok = corr > 0.55 and imae < 0.10
+        links.append({"i": i, "dx": int(dx), "corr": round(corr, 3),
+                      "overlap_ink_mae": round(imae, 4),
                       "accepted": ok, "t0": kept[i]["t0"]})
         offsets.append(offsets[-1] + (int(dx) if ok else 0))
-        print(f"  link {i:3d} t={kept[i]['t0']:7.2f} dx={int(dx):5d} corr={corr:5.3f} mae={mae:6.2f} {'ok' if ok else 'REJECT'}")
+        print(f"  link {i:3d} t={kept[i]['t0']:7.2f} dx={int(dx):5d} "
+              f"corr={corr:5.3f} ink_mae={imae:6.4f} {'ok' if ok else 'REJECT'}")
 
     total_w = offsets[-1] + width
     canvas = np.full((height, total_w), 255, np.uint8)
